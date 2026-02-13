@@ -1,11 +1,11 @@
-# Build Stage - Use standard JDK (non-alpine) to ensure Protoc (C++) works
+# Build Stage - Using Standard JDK (Debian-based) to support Protoc
 FROM eclipse-temurin:21-jdk AS build
 WORKDIR /app
 COPY . .
 RUN chmod +x mvnw
 RUN ./mvnw clean package -DskipTests
 
-# Run Stage - Alpine is fine here for running the JAR
+# Run Stage - Alpine is fine here
 FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
