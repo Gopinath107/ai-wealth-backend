@@ -1,6 +1,8 @@
 package com.djai.wealthadvisor.service.impl;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -115,10 +117,18 @@ public class AiAdvisorServiceImpl {
             List<AiChatMessage> history = messageRepository.findBySessionId(session.getId(), PageRequest.of(0, 10));
             Collections.reverse(history);
 
-            String systemPrompt = aiPromptService.buildSystemPrompt(user, watchlist, goals);
-            Map<String, Object> payload = prepareGroqPayload(systemPrompt, history, text);
+            String rawReply;
 
-            String rawReply = callGroqApiWithRetry(payload);
+            // Route price/market queries to compound model (has web search for real-time
+            // data)
+            if (isPriceQuery(text)) {
+                log.info("Price query detected, using compound model with web search");
+                rawReply = callCompoundForPriceQuery(text);
+            } else {
+                String systemPrompt = aiPromptService.buildSystemPrompt(user, watchlist, goals);
+                Map<String, Object> payload = prepareGroqPayload(systemPrompt, history, text);
+                rawReply = callGroqApiWithRetry(payload);
+            }
 
             // Validate response
             if (rawReply == null || rawReply.isBlank()) {
@@ -143,7 +153,8 @@ public class AiAdvisorServiceImpl {
                 }
             }
 
-            saveMessage(session, "assistant", rawReply);
+            // Save CLEAN reply (without follow-ups) to DB to prevent duplicate rendering
+            saveMessage(session, "assistant", cleanReply);
 
             session.setUpdatedAt(LocalDateTime.now());
             sessionRepository.save(session);
@@ -168,13 +179,63 @@ public class AiAdvisorServiceImpl {
     // ════════════════════════════════════════════════════════════════
     private int findFollowUpIndex(String text) {
         String[] markers = { "## Follow-ups", "## Follow-Ups", "## Follow ups",
-                "**Follow-ups**", "**Follow-Ups**", "**Follow ups**" };
+                "**Follow-ups**", "**Follow-Ups**", "**Follow ups**",
+                "### Follow-ups", "### Follow-Ups",
+                "Follow-ups\n", "Follow-Ups\n" };
+        int earliest = -1;
         for (String m : markers) {
             int idx = text.indexOf(m);
-            if (idx != -1)
-                return idx;
+            if (idx != -1 && (earliest == -1 || idx < earliest)) {
+                earliest = idx;
+            }
         }
-        return -1;
+        return earliest;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Helper: detect price/market queries that need web search
+    // ════════════════════════════════════════════════════════════════
+    private boolean isPriceQuery(String message) {
+        if (message == null)
+            return false;
+        String lower = message.toLowerCase();
+        String[] priceKeywords = {
+                "gold price", "silver price", "current price", "today price",
+                "nifty", "sensex", "stock price", "share price",
+                "bitcoin price", "crypto price", "market price",
+                "goldbees", "gold etf", "commodity price",
+                "what is the price", "how much is", "rate of gold",
+                "gold rate", "silver rate", "oil price"
+        };
+        for (String keyword : priceKeywords) {
+            if (lower.contains(keyword))
+                return true;
+        }
+        return false;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Compound model call for price queries (tiny prompt, web search enabled)
+    // ════════════════════════════════════════════════════════════════
+    private String callCompoundForPriceQuery(String userMessage) {
+        String today = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
+        String miniPrompt = "You are DJ-AI, an Indian financial advisor. Today: " + today
+                + ". SEARCH the web for CURRENT prices. Use ONLY ₹ (INR). "
+                + "Use proper Markdown: ## headings, **bold** prices, | tables |. "
+                + "Keep response under 200 words. "
+                + "At the end add: ## Follow-ups with 3 numbered questions.";
+
+        List<Map<String, String>> messages = new ArrayList<>();
+        messages.add(Map.of("role", "system", "content", miniPrompt));
+        messages.add(Map.of("role", "user", "content", userMessage));
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("model", groqModel); // compound model — has web search
+        payload.put("messages", messages);
+        payload.put("temperature", 0.7);
+        payload.put("max_tokens", 1500);
+
+        return callGroqApiWithRetry(payload);
     }
 
     public List<ChatSessionDto> getUserSessions(Long userId) {
@@ -197,7 +258,15 @@ public class AiAdvisorServiceImpl {
             ChatHistoryDto dto = new ChatHistoryDto();
             dto.setId(m.getId());
             dto.setRole(m.getRole());
-            dto.setContent(m.getContent());
+            // Strip follow-up section from historical assistant messages (safety net)
+            String content = m.getContent();
+            if ("assistant".equals(m.getRole())) {
+                int fIdx = findFollowUpIndex(content);
+                if (fIdx != -1) {
+                    content = content.substring(0, fIdx).trim();
+                }
+            }
+            dto.setContent(content);
             dto.setTimestamp(m.getTimestamp());
             return dto;
         }).toList();
