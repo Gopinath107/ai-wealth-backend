@@ -54,9 +54,13 @@ public class AiAdvisorServiceImpl {
     private String groqUrl;
 
     @Value("${api.groq.model}")
-    private String groqModel;
+    private String groqModel; // groq/compound — only used as fallback for web search
+
+    @Value("${api.groq.model.lite}")
+    private String groqModelLite; // llama-3.3-70b-versatile — primary model for chat
 
     private final RestClient restClient = RestClient.create();
+    private static final int MAX_RETRIES = 3;
 
     public AdvisorResponseDto processChat(AdvisorRequestDto request) {
         AdvisorResponseDto response = new AdvisorResponseDto();
@@ -114,27 +118,20 @@ public class AiAdvisorServiceImpl {
             String systemPrompt = aiPromptService.buildSystemPrompt(user, watchlist, goals);
             Map<String, Object> payload = prepareGroqPayload(systemPrompt, history, text);
 
-            String rawReply = callGroqApi(payload);
+            String rawReply = callGroqApiWithRetry(payload);
 
-            // Validate response — handle empty/null AI replies gracefully
+            // Validate response
             if (rawReply == null || rawReply.isBlank()) {
-                rawReply = "I'm sorry, I couldn't generate a response for that query. Could you please rephrase your question?";
+                rawReply = "I'm sorry, I couldn't generate a response. Could you please rephrase your question?";
             }
 
             // Parse follow-up suggestions from the AI response
             List<String> followUps = new ArrayList<>();
             String cleanReply = rawReply;
-            int followUpIdx = rawReply.indexOf("## Follow-ups");
-            if (followUpIdx == -1)
-                followUpIdx = rawReply.indexOf("## Follow-Ups");
-            if (followUpIdx == -1)
-                followUpIdx = rawReply.indexOf("**Follow-ups**");
-            if (followUpIdx == -1)
-                followUpIdx = rawReply.indexOf("**Follow-Ups**");
+            int followUpIdx = findFollowUpIndex(rawReply);
             if (followUpIdx != -1) {
                 String followUpSection = rawReply.substring(followUpIdx);
                 cleanReply = rawReply.substring(0, followUpIdx).trim();
-                // Extract numbered items like "1. What is..." or "- What is..."
                 for (String line : followUpSection.split("\n")) {
                     String trimmed = line.trim();
                     if (trimmed.matches("^\\d+\\.\\s+.+") || trimmed.matches("^[-*]\\s+.+")) {
@@ -159,12 +156,25 @@ public class AiAdvisorServiceImpl {
 
         } catch (Exception e) {
             log.error("Chat Error", e);
-
             response.setStatus("ERROR");
             response.setReply(
                     "I'm having trouble connecting to the AI service right now. Please try again in a moment.");
         }
         return response;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Helper: find follow-up section in AI response
+    // ════════════════════════════════════════════════════════════════
+    private int findFollowUpIndex(String text) {
+        String[] markers = { "## Follow-ups", "## Follow-Ups", "## Follow ups",
+                "**Follow-ups**", "**Follow-Ups**", "**Follow ups**" };
+        for (String m : markers) {
+            int idx = text.indexOf(m);
+            if (idx != -1)
+                return idx;
+        }
+        return -1;
     }
 
     public List<ChatSessionDto> getUserSessions(Long userId) {
@@ -223,23 +233,60 @@ public class AiAdvisorServiceImpl {
         messages.add(Map.of("role", "user", "content", currentMsg));
 
         Map<String, Object> payload = new HashMap<>();
-        payload.put("model", groqModel);
+        payload.put("model", groqModelLite); // Use lite model — compound crashes with large system prompts
         payload.put("messages", messages);
         payload.put("temperature", 0.7);
+        payload.put("max_tokens", 1500);
         return payload;
     }
 
-    private String callGroqApi(Map<String, Object> payload) {
-        try {
-            String body = restClient.post().uri(groqUrl)
-                    .header("Authorization", "Bearer " + groqApiKey)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .body(payload).retrieve().body(String.class);
-            JsonNode root = objectMapper.readTree(body);
-            return root.path("choices").get(0).path("message").path("content").asText();
-        } catch (Exception e) {
-            log.error("External AI API Error", e);
-            throw new RuntimeException("AI Service is unreachable");
+    // ════════════════════════════════════════════════════════════════
+    // API CALL — with retry on 429 rate limit
+    // ════════════════════════════════════════════════════════════════
+    private String callGroqApiWithRetry(Map<String, Object> payload) {
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                String body = restClient.post().uri(groqUrl)
+                        .header("Authorization", "Bearer " + groqApiKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(payload).retrieve().body(String.class);
+                JsonNode root = objectMapper.readTree(body);
+                return root.path("choices").get(0).path("message").path("content").asText();
+            } catch (org.springframework.web.client.HttpClientErrorException.TooManyRequests e) {
+                long waitMs = parseRetryDelay(e.getResponseBodyAsString());
+                log.warn("Advisor rate limited (attempt {}/{}). Waiting {}ms...", attempt, MAX_RETRIES, waitMs);
+                if (attempt == MAX_RETRIES) {
+                    throw new RuntimeException("Rate limit exceeded after " + MAX_RETRIES + " retries.");
+                }
+                try {
+                    Thread.sleep(waitMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted during rate limit wait");
+                }
+            } catch (org.springframework.web.client.HttpClientErrorException e) {
+                log.error("AI API error: {} {}", e.getStatusCode(), e.getResponseBodyAsString());
+                throw new RuntimeException("AI API error: " + e.getStatusCode());
+            } catch (Exception e) {
+                log.error("External AI API Error", e);
+                throw new RuntimeException("AI Service is unreachable: " + e.getMessage());
+            }
         }
+        throw new RuntimeException("Failed after " + MAX_RETRIES + " retries");
+    }
+
+    private long parseRetryDelay(String errorBody) {
+        try {
+            if (errorBody != null) {
+                java.util.regex.Matcher mMs = java.util.regex.Pattern.compile("in (\\d+)ms").matcher(errorBody);
+                if (mMs.find())
+                    return Long.parseLong(mMs.group(1)) + 200;
+                java.util.regex.Matcher mS = java.util.regex.Pattern.compile("in ([\\d.]+)s").matcher(errorBody);
+                if (mS.find())
+                    return (long) (Double.parseDouble(mS.group(1)) * 1000) + 200;
+            }
+        } catch (Exception ignored) {
+        }
+        return 2000;
     }
 }
