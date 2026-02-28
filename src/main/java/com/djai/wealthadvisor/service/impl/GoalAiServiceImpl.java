@@ -38,7 +38,10 @@ public class GoalAiServiceImpl implements GoalAiService {
     private String groqUrl;
 
     @Value("${api.groq.model}")
-    private String groqModel;
+    private String groqModel; // groq/compound — for final plan with web search
+
+    @Value("${api.groq.model.lite}")
+    private String groqModelLite; // llama-3.3-70b-versatile — for clarification questions
 
     private RestClient restClient;
 
@@ -50,10 +53,14 @@ public class GoalAiServiceImpl implements GoalAiService {
         this.restClient = RestClient.builder().requestFactory(factory).build();
     }
 
+    private static final int MAX_RETRIES = 3;
+
     // ════════════════════════════════════════════════════════════════
-    // SYSTEM PROMPT — Built dynamically with today's date
+    // SYSTEM PROMPTS
     // ════════════════════════════════════════════════════════════════
-    private String buildSystemPrompt() {
+
+    /** Lite model prompt — for clarification questions (no web search) */
+    private String buildClarificationPrompt() {
         String today = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
         return """
                 You are an AI Financial Goal Planner for an Indian investment app.
@@ -68,23 +75,39 @@ public class GoalAiServiceImpl implements GoalAiService {
                 3. INVESTMENT GOAL (retirement, wealth, passive income):
                    → Ask: target amount, target year, monthly contribution, risk preference (Low/Moderate/High).
                 4. Never assume or fabricate prices. Ask step-by-step, one question at a time.
-                5. When ready to plan: search for CURRENT INDIA on-road/market price. Use ONLY Indian pricing sources. All amounts in ₹ (INR). NEVER use $.
+                5. All amounts in ₹ (INR). NEVER use $.
 
                 OUTPUT (strict JSON, no markdown):
 
-                If clarifying:
+                If MORE INFO NEEDED (clarifying):
                 {"question":"your question","suggestions":["Option 1","Option 2","Option 3","Option 4"]}
 
-                If planning (all details collected):
-                {"name":"string","type":"Purchase|Retirement|Savings|Emergency Fund|Education|Vacation|House Down Payment|Wedding|Debt Payoff|Custom","targetAmount":number,"currentAmount":0,"deadline":"YYYY-MM-DD","monthlyContribution":number,"riskProfile":"string","allocationStrategy":[{"assetClass":"string","percentage":number}],"milestones":["string with ₹ amounts"]}
+                If ALL DETAILS COLLECTED (ready to generate plan):
+                {"ready":true,"summary":"concise summary of what user wants, e.g. Buy Maruti Suzuki Baleno in Chennai"}
 
+                IMPORTANT: When all required details are collected, output ONLY the ready JSON. Do NOT generate the financial plan yourself.
+                """
+                .formatted(today);
+    }
+
+    /**
+     * Compound model prompt — for final plan generation with real-time web search
+     * pricing
+     */
+    private String buildPlanPrompt() {
+        String today = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
+        return """
+                Today: %s. Search for the CURRENT INDIA on-road/market price. Use ONLY ₹ (INR). NEVER use $.
+                Generate a financial plan as strict JSON:
+                {"name":"string","type":"Purchase|Retirement|Savings|Emergency Fund|Education|Vacation|House Down Payment|Wedding|Debt Payoff|Custom","targetAmount":number,"currentAmount":0,"deadline":"YYYY-MM-DD","monthlyContribution":number,"riskProfile":"string","allocationStrategy":[{"assetClass":"string","percentage":number}],"milestones":["string with ₹ amounts"]}
                 Allocation: <3yrs: FD, Liquid Funds. 3-7yrs: Hybrid, Debt, Gold. >7yrs: Equity MF, Stocks, PPF.
+                All deadlines MUST be after today.
                 """
                 .formatted(today);
     }
 
     // ════════════════════════════════════════════════════════════════
-    // PUBLIC API — accepts full conversation history
+    // PUBLIC API
     // ════════════════════════════════════════════════════════════════
     @Override
     public GoalDto generatePlan(String userPrompt) {
@@ -95,13 +118,29 @@ public class GoalAiServiceImpl implements GoalAiService {
     public GoalDto generatePlanFromMessages(List<Map<String, String>> conversationHistory, Long userId) {
         log.info("Generating AI plan for userId={}, {} messages in history", userId, conversationHistory.size());
         try {
-            Map<String, Object> payload = preparePayload(conversationHistory);
-            String rawJson = callGroqApi(payload);
-            String cleanJson = cleanResponse(rawJson);
-            log.info("Clean AI JSON: {}", cleanJson);
-            GoalDto result = objectMapper.readValue(cleanJson, GoalDto.class);
-            result.setUserId(userId); // Always attach userId to response
+            // PHASE 1: Use lite model for clarification
+            String liteResponse = callLiteModel(conversationHistory);
+            String cleanLite = cleanResponse(liteResponse);
+            log.info("Lite model response: {}", cleanLite);
+
+            JsonNode liteJson = objectMapper.readTree(cleanLite);
+
+            // Check if lite model says "all details collected"
+            if (liteJson.has("ready") && liteJson.path("ready").asBoolean(false)) {
+                // PHASE 2: Use compound model for real-time pricing
+                String summary = liteJson.path("summary").asText("Generate a financial plan");
+                log.info("All details collected. Calling compound model with summary: {}", summary);
+
+                GoalDto result = callCompoundModel(summary);
+                result.setUserId(userId);
+                return result;
+            }
+
+            // Still clarifying — return the question
+            GoalDto result = objectMapper.readValue(cleanLite, GoalDto.class);
+            result.setUserId(userId);
             return result;
+
         } catch (Exception e) {
             log.error("AI Goal Generation Failed", e);
             throw new RuntimeException("Failed to generate goal plan: " + e.getMessage());
@@ -109,44 +148,75 @@ public class GoalAiServiceImpl implements GoalAiService {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // INTERNALS
+    // PHASE 1: Lite model — clarification questions
     // ════════════════════════════════════════════════════════════════
-    private static final int MAX_HISTORY_MESSAGES = 6; // keep token usage low for compound model
-    private static final int MAX_RETRIES = 3;
-
-    private Map<String, Object> preparePayload(List<Map<String, String>> conversationHistory) {
-        List<Map<String, String>> trimmed = trimConversation(conversationHistory);
-
+    private String callLiteModel(List<Map<String, String>> conversationHistory) {
         List<Map<String, String>> messages = new ArrayList<>();
-        messages.add(Map.of("role", "system", "content", buildSystemPrompt()));
-        messages.addAll(trimmed);
+        messages.add(Map.of("role", "system", "content", buildClarificationPrompt()));
+        messages.addAll(conversationHistory);
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("model", groqModelLite);
+        payload.put("messages", messages);
+        payload.put("temperature", 0.7);
+        payload.put("max_tokens", 512);
+
+        return callGroqApi(payload);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // PHASE 2: Compound model — plan with real-time pricing
+    // ════════════════════════════════════════════════════════════════
+    private GoalDto callCompoundModel(String summary) {
+        // Send ONLY the summary + tiny plan prompt to compound model
+        List<Map<String, String>> messages = new ArrayList<>();
+        messages.add(Map.of("role", "system", "content", buildPlanPrompt()));
+        messages.add(Map.of("role", "user", "content", summary));
 
         Map<String, Object> payload = new HashMap<>();
         payload.put("model", groqModel);
         payload.put("messages", messages);
         payload.put("temperature", 0.7);
         payload.put("max_tokens", 1024);
-        return payload;
-    }
 
-    /**
-     * Trim conversation to reduce token usage.
-     * Keeps the first user message (original goal) + the last N messages for
-     * context.
-     */
-    private List<Map<String, String>> trimConversation(List<Map<String, String>> history) {
-        if (history.size() <= MAX_HISTORY_MESSAGES) {
-            return history;
+        try {
+            String rawJson = callGroqApi(payload);
+            String cleanJson = cleanResponse(rawJson);
+            log.info("Compound model plan JSON: {}", cleanJson);
+            return objectMapper.readValue(cleanJson, GoalDto.class);
+        } catch (Exception e) {
+            // FALLBACK: If compound model fails (413/429), generate plan with lite model
+            log.warn("Compound model failed ({}), falling back to lite model for plan generation", e.getMessage());
+            return callLiteModelForPlan(summary);
         }
-        List<Map<String, String>> trimmed = new ArrayList<>();
-        trimmed.add(history.get(0)); // always keep the first user message (the goal)
-        // keep the last (MAX_HISTORY_MESSAGES - 1) messages
-        int start = history.size() - (MAX_HISTORY_MESSAGES - 1);
-        trimmed.addAll(history.subList(start, history.size()));
-        log.info("Trimmed conversation from {} to {} messages", history.size(), trimmed.size());
-        return trimmed;
     }
 
+    /** Fallback: generate plan using lite model if compound model is unavailable */
+    private GoalDto callLiteModelForPlan(String summary) {
+        List<Map<String, String>> messages = new ArrayList<>();
+        messages.add(Map.of("role", "system", "content", buildPlanPrompt()));
+        messages.add(Map.of("role", "user", "content",
+                summary + " Use current approximate India market prices in ₹."));
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("model", groqModelLite);
+        payload.put("messages", messages);
+        payload.put("temperature", 0.7);
+        payload.put("max_tokens", 1024);
+
+        try {
+            String rawJson = callGroqApi(payload);
+            String cleanJson = cleanResponse(rawJson);
+            log.info("Lite model fallback plan JSON: {}", cleanJson);
+            return objectMapper.readValue(cleanJson, GoalDto.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Both compound and lite models failed: " + e.getMessage());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // HTTP CLIENT — with retry on 429
+    // ════════════════════════════════════════════════════════════════
     private String callGroqApi(Map<String, Object> payload) {
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
@@ -160,7 +230,6 @@ public class GoalAiServiceImpl implements GoalAiService {
                 JsonNode root = objectMapper.readTree(body);
                 return root.path("choices").get(0).path("message").path("content").asText();
             } catch (org.springframework.web.client.HttpClientErrorException.TooManyRequests e) {
-                // 429 — parse retry delay from Groq error and wait
                 long waitMs = parseRetryDelay(e.getResponseBodyAsString());
                 log.warn("Rate limited (attempt {}/{}). Waiting {}ms before retry...", attempt, MAX_RETRIES, waitMs);
                 if (attempt == MAX_RETRIES) {
@@ -182,18 +251,12 @@ public class GoalAiServiceImpl implements GoalAiService {
         throw new RuntimeException("Failed after " + MAX_RETRIES + " retries");
     }
 
-    /**
-     * Parse retry delay from Groq 429 error body. Looks for "try again in XXms" or
-     * "try again in X.Xs".
-     * Falls back to 2 seconds if parsing fails.
-     */
     private long parseRetryDelay(String errorBody) {
         try {
             if (errorBody != null) {
-                // Match patterns like "in 852ms" or "in 1.5s"
                 java.util.regex.Matcher mMs = java.util.regex.Pattern.compile("in (\\d+)ms").matcher(errorBody);
                 if (mMs.find()) {
-                    return Long.parseLong(mMs.group(1)) + 200; // add 200ms buffer
+                    return Long.parseLong(mMs.group(1)) + 200;
                 }
                 java.util.regex.Matcher mS = java.util.regex.Pattern.compile("in ([\\d.]+)s").matcher(errorBody);
                 if (mS.find()) {
@@ -202,9 +265,12 @@ public class GoalAiServiceImpl implements GoalAiService {
             }
         } catch (Exception ignored) {
         }
-        return 2000; // default 2s wait
+        return 2000;
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // RESPONSE CLEANING
+    // ════════════════════════════════════════════════════════════════
     private String cleanResponse(String text) {
         if (text == null || text.isBlank())
             return "{\"question\":\"I couldn't generate a response. Please try again.\",\"suggestions\":[]}";
@@ -221,8 +287,7 @@ public class GoalAiServiceImpl implements GoalAiService {
             return clean.substring(firstBrace, lastBrace + 1);
         }
 
-        // FALLBACK: AI returned plain text instead of JSON — wrap it as a clarification
-        // question
+        // FALLBACK: AI returned plain text instead of JSON — wrap as a question
         log.warn("AI returned non-JSON response, wrapping as question: {}", clean);
         String escaped = clean.replace("\\", "\\\\").replace("\"", "\\\"")
                 .replace("\n", " ").replace("\r", "");
