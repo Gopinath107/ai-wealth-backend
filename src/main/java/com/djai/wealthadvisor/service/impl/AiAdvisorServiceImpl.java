@@ -69,6 +69,9 @@ public class AiAdvisorServiceImpl {
     private final RestClient restClient = RestClient.create();
     private static final int MAX_RETRIES = 3;
 
+    // Thread-local storage for instrument keys found during price queries
+    private final ThreadLocal<List<String>> foundInstrumentKeys = new ThreadLocal<>();
+
     public AdvisorResponseDto processChat(AdvisorRequestDto request) {
         AdvisorResponseDto response = new AdvisorResponseDto();
         response.setTimestamp(LocalDateTime.now());
@@ -168,6 +171,14 @@ public class AiAdvisorServiceImpl {
             response.setChatTitle(session.getTitle());
             response.setReply(cleanReply);
             response.setFollowUps(followUps.isEmpty() ? null : followUps);
+
+            // Attach instrument keys for chart rendering (if price query found instruments)
+            List<String> instKeys = foundInstrumentKeys.get();
+            if (instKeys != null && !instKeys.isEmpty()) {
+                response.setInstrumentKeys(instKeys);
+            }
+            foundInstrumentKeys.remove();
+
             response.setStatus("SUCCESS");
 
         } catch (Exception e) {
@@ -299,6 +310,7 @@ public class AiAdvisorServiceImpl {
             String[] searchTerms = extractSearchTerms(lower);
 
             StringBuilder priceData = new StringBuilder();
+            List<String> collectedKeys = new ArrayList<>();
             for (String term : searchTerms) {
                 List<InstrumentMaster> instruments = instrumentRepo.search(term, null, 3);
                 if (!instruments.isEmpty()) {
@@ -314,12 +326,18 @@ public class AiAdvisorServiceImpl {
                                         quote.getLtp(),
                                         quote.getPrevClose(),
                                         quote.getChangePercent()));
+                                collectedKeys.add(inst.getInstrumentKey());
                             }
                         } catch (Exception e) {
                             log.warn("Failed to fetch quote for {}: {}", inst.getTradingSymbol(), e.getMessage());
                         }
                     }
                 }
+            }
+
+            // Store found instrument keys for chart rendering
+            if (!collectedKeys.isEmpty()) {
+                foundInstrumentKeys.set(collectedKeys);
             }
 
             String result = priceData.toString().trim();
@@ -383,7 +401,14 @@ public class AiAdvisorServiceImpl {
                 "the", "is", "of", "in", "for", "and", "or", "to", "at", "on",
                 "what", "how", "much", "price", "current", "today", "now",
                 "give", "me", "show", "tell", "can", "you", "please",
-                "stock", "share", "etf", "rate", "value", "cost").contains(word);
+                "stock", "share", "etf", "rate", "value", "cost",
+                // Commodities — these are NOT instrument symbols; they should
+                // go to compound model for physical market prices
+                "gold", "silver", "oil", "crude", "bitcoin", "crypto",
+                "ethereum", "nifty", "sensex", "market", "commodity",
+                "it", "its", "will", "be", "my", "this", "that",
+                "any", "impact", "increase", "decrease", "future",
+                "monday", "opening", "expect", "also", "hi", "hello").contains(word);
     }
 
     public List<ChatSessionDto> getUserSessions(Long userId) {

@@ -10,6 +10,7 @@ public class AdvisorResponseDto {
     private String chatTitle; // Return title (e.g. "Tata Motors Analysis")
     private String reply;
     private List<String> followUps; // Suggested follow-up questions
+    private List<String> instrumentKeys; // For price chart rendering (e.g., ["NSE_EQ|INE..."])
     private LocalDateTime timestamp;
     private String status;
 }
