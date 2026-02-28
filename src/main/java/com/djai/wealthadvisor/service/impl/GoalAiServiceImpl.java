@@ -111,10 +111,15 @@ public class GoalAiServiceImpl implements GoalAiService {
     // ════════════════════════════════════════════════════════════════
     // INTERNALS
     // ════════════════════════════════════════════════════════════════
+    private static final int MAX_HISTORY_MESSAGES = 6; // keep token usage low for compound model
+    private static final int MAX_RETRIES = 3;
+
     private Map<String, Object> preparePayload(List<Map<String, String>> conversationHistory) {
+        List<Map<String, String>> trimmed = trimConversation(conversationHistory);
+
         List<Map<String, String>> messages = new ArrayList<>();
         messages.add(Map.of("role", "system", "content", buildSystemPrompt()));
-        messages.addAll(conversationHistory);
+        messages.addAll(trimmed);
 
         Map<String, Object> payload = new HashMap<>();
         payload.put("model", groqModel);
@@ -124,20 +129,80 @@ public class GoalAiServiceImpl implements GoalAiService {
         return payload;
     }
 
-    private String callGroqApi(Map<String, Object> payload) {
-        String body = restClient.post().uri(groqUrl)
-                .header("Authorization", "Bearer " + groqApiKey)
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(payload)
-                .retrieve()
-                .body(String.class);
-
-        try {
-            JsonNode root = objectMapper.readTree(body);
-            return root.path("choices").get(0).path("message").path("content").asText();
-        } catch (Exception e) {
-            throw new RuntimeException("Invalid response from AI provider");
+    /**
+     * Trim conversation to reduce token usage.
+     * Keeps the first user message (original goal) + the last N messages for
+     * context.
+     */
+    private List<Map<String, String>> trimConversation(List<Map<String, String>> history) {
+        if (history.size() <= MAX_HISTORY_MESSAGES) {
+            return history;
         }
+        List<Map<String, String>> trimmed = new ArrayList<>();
+        trimmed.add(history.get(0)); // always keep the first user message (the goal)
+        // keep the last (MAX_HISTORY_MESSAGES - 1) messages
+        int start = history.size() - (MAX_HISTORY_MESSAGES - 1);
+        trimmed.addAll(history.subList(start, history.size()));
+        log.info("Trimmed conversation from {} to {} messages", history.size(), trimmed.size());
+        return trimmed;
+    }
+
+    private String callGroqApi(Map<String, Object> payload) {
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                String body = restClient.post().uri(groqUrl)
+                        .header("Authorization", "Bearer " + groqApiKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(payload)
+                        .retrieve()
+                        .body(String.class);
+
+                JsonNode root = objectMapper.readTree(body);
+                return root.path("choices").get(0).path("message").path("content").asText();
+            } catch (org.springframework.web.client.HttpClientErrorException.TooManyRequests e) {
+                // 429 — parse retry delay from Groq error and wait
+                long waitMs = parseRetryDelay(e.getResponseBodyAsString());
+                log.warn("Rate limited (attempt {}/{}). Waiting {}ms before retry...", attempt, MAX_RETRIES, waitMs);
+                if (attempt == MAX_RETRIES) {
+                    throw new RuntimeException("Rate limit exceeded after " + MAX_RETRIES
+                            + " retries. Please try again in a few seconds.");
+                }
+                try {
+                    Thread.sleep(waitMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while waiting for rate limit retry");
+                }
+            } catch (org.springframework.web.client.HttpClientErrorException e) {
+                throw new RuntimeException(e.getStatusCode() + " " + e.getResponseBodyAsString());
+            } catch (Exception e) {
+                throw new RuntimeException("Invalid response from AI provider: " + e.getMessage());
+            }
+        }
+        throw new RuntimeException("Failed after " + MAX_RETRIES + " retries");
+    }
+
+    /**
+     * Parse retry delay from Groq 429 error body. Looks for "try again in XXms" or
+     * "try again in X.Xs".
+     * Falls back to 2 seconds if parsing fails.
+     */
+    private long parseRetryDelay(String errorBody) {
+        try {
+            if (errorBody != null) {
+                // Match patterns like "in 852ms" or "in 1.5s"
+                java.util.regex.Matcher mMs = java.util.regex.Pattern.compile("in (\\d+)ms").matcher(errorBody);
+                if (mMs.find()) {
+                    return Long.parseLong(mMs.group(1)) + 200; // add 200ms buffer
+                }
+                java.util.regex.Matcher mS = java.util.regex.Pattern.compile("in ([\\d.]+)s").matcher(errorBody);
+                if (mS.find()) {
+                    return (long) (Double.parseDouble(mS.group(1)) * 1000) + 200;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return 2000; // default 2s wait
     }
 
     private String cleanResponse(String text) {
