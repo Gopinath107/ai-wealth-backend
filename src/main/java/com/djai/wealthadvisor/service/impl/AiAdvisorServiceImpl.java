@@ -127,12 +127,28 @@ public class AiAdvisorServiceImpl {
 
             String rawReply;
 
-            // Route price/market queries to compound model (has web search for real-time
-            // data)
-            if (isPriceQuery(text)) {
-                log.info("Price query detected, using compound model with web search");
-                rawReply = callCompoundForPriceQuery(text);
+            // Step 1: Always try to identify instruments in the message to show charts &
+            // live prices
+            String realPriceData = fetchRealPriceData(text);
+
+            if (realPriceData != null && !realPriceData.isBlank()) {
+                // If instruments found, use standard chat with live price injection
+                log.info("Found real market data, injecting into standard chat response");
+                String systemPrompt = aiPromptService.buildSystemPrompt(user, watchlist, goals);
+                systemPrompt += "\n\nREAL-TIME MARKET DATA (from Upstox/NSE/BSE):\n" + realPriceData
+                        + "\nRULES:\n1. Use these verified live prices in your response if relevant.\n"
+                        + "2. Format your response clearly with Markdown.\n"
+                        + "3. Add a brief analysis.";
+
+                Map<String, Object> payload = prepareGroqPayload(systemPrompt, history, text);
+                rawReply = callGroqApiWithRetry(payload);
+            } else if (isPriceQuery(text)) {
+                // Step 2: If NO instruments found but it's clearly a price query (e.g.,
+                // physical gold, crypto), use compound search
+                log.info("Price query detected without specific NSE/BSE instruments, using compound model search");
+                rawReply = callCompoundForPriceQueryFallback(text);
             } else {
+                // Step 3: Standard chat
                 String systemPrompt = aiPromptService.buildSystemPrompt(user, watchlist, goals);
                 Map<String, Object> payload = prepareGroqPayload(systemPrompt, history, text);
                 rawReply = callGroqApiWithRetry(payload);
@@ -243,44 +259,13 @@ public class AiAdvisorServiceImpl {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // Price query handler: real Upstox data first, compound fallback
+    // Price query handler: Compound fallback for web search
     // ════════════════════════════════════════════════════════════════
-    private String callCompoundForPriceQuery(String userMessage) {
+    private String callCompoundForPriceQueryFallback(String userMessage) {
         String today = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
 
-        // Step 1: Try to find real instrument data from Upstox
-        String realPriceData = fetchRealPriceData(userMessage);
-
-        if (realPriceData != null && !realPriceData.isBlank()) {
-            // We have REAL data — use lite model to format a nice response
-            log.info("Found real market data, using lite model with injected prices");
-            String prompt = "You are DJ-AI, an Indian financial advisor. Today: " + today + ".\n\n"
-                    + "REAL-TIME MARKET DATA (from Upstox/NSE/BSE — these are VERIFIED live prices):\n"
-                    + realPriceData + "\n\n"
-                    + "RULES:\n"
-                    + "1. Use ONLY the prices provided above. Do NOT change or guess different prices.\n"
-                    + "2. Format with Markdown: ## heading, **bold** prices, | tables |.\n"
-                    + "3. Add brief analysis (2-3 sentences) about the stock/ETF.\n"
-                    + "4. Keep response under 200 words.\n"
-                    + "5. All prices in \u20b9 (INR).\n"
-                    + "At the end add: ## Follow-ups with 3 numbered questions.";
-
-            List<Map<String, String>> messages = new ArrayList<>();
-            messages.add(Map.of("role", "system", "content", prompt));
-            messages.add(Map.of("role", "user", "content", userMessage));
-
-            Map<String, Object> payload = new HashMap<>();
-            payload.put("model", groqModelLite);
-            payload.put("messages", messages);
-            payload.put("temperature", 0.3);
-            payload.put("max_tokens", 1500);
-
-            return callGroqApiWithRetry(payload);
-        }
-
-        // Step 2: No instrument found — fall back to compound model (web search)
+        // No instrument found — fall back to compound model (web search)
         // This handles physical gold, silver, crypto, etc.
-        log.info("No instrument found, falling back to compound model web search");
         String miniPrompt = "You are DJ-AI, an Indian financial advisor. Today: " + today + ".\n\n"
                 + "SEARCH the web for the EXACT CURRENT LIVE PRICE. "
                 + "Use ONLY \u20b9 (INR). NEVER guess prices.\n"
@@ -469,11 +454,12 @@ public class AiAdvisorServiceImpl {
         List<Map<String, String>> messages = new ArrayList<>();
         messages.add(Map.of("role", "system", "content", systemPrompt));
         for (AiChatMessage msg : history) {
-            if (!msg.getContent().equals(currentMsg)) {
-                messages.add(Map.of("role", msg.getRole(), "content", msg.getContent()));
+            String content = msg.getContent();
+            if (content != null && !content.equals(currentMsg)) {
+                messages.add(Map.of("role", msg.getRole(), "content", content));
             }
         }
-        messages.add(Map.of("role", "user", "content", currentMsg));
+        messages.add(Map.of("role", "user", "content", currentMsg != null ? currentMsg : ""));
 
         Map<String, Object> payload = new HashMap<>();
         payload.put("model", groqModelLite); // Use lite model — compound crashes with large system prompts
