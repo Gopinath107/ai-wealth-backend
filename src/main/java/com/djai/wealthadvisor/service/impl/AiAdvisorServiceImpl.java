@@ -185,7 +185,8 @@ public class AiAdvisorServiceImpl {
             log.error("Chat Error", e);
             response.setStatus("ERROR");
             response.setReply(
-                    "I'm having trouble connecting to the AI service right now. Please try again in a moment.");
+                    "I'm having trouble connecting to the AI service right now. " +
+                            "Error: " + e.getClass().getSimpleName() + " - " + e.getMessage());
         }
         return response;
     }
