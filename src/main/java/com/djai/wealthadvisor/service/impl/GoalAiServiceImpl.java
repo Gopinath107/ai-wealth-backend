@@ -206,8 +206,8 @@ public class GoalAiServiceImpl implements GoalAiService {
     }
 
     private String cleanResponse(String text) {
-        if (text == null)
-            return "{}";
+        if (text == null || text.isBlank())
+            return "{\"question\":\"I couldn't generate a response. Please try again.\",\"suggestions\":[]}";
         String clean = text.replace("```json", "").replace("```", "").trim();
 
         // Handle double-serialized JSON
@@ -220,6 +220,12 @@ public class GoalAiServiceImpl implements GoalAiService {
         if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
             return clean.substring(firstBrace, lastBrace + 1);
         }
-        return clean;
+
+        // FALLBACK: AI returned plain text instead of JSON — wrap it as a clarification
+        // question
+        log.warn("AI returned non-JSON response, wrapping as question: {}", clean);
+        String escaped = clean.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", " ").replace("\r", "");
+        return "{\"question\":\"" + escaped + "\",\"suggestions\":[]}";
     }
 }
