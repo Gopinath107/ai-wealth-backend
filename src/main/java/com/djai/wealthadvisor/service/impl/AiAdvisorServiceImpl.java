@@ -35,6 +35,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.djai.wealthadvisor.service.MarketQuoteService;
+import com.djai.wealthadvisor.repository.InstrumentMasterRepository;
+import com.djai.wealthadvisor.entity.InstrumentMaster;
 
 @Slf4j
 @Service
@@ -48,6 +51,8 @@ public class AiAdvisorServiceImpl {
     private final AiChatMessageRepository messageRepository;
     private final AiPromptService aiPromptService;
     private final ObjectMapper objectMapper;
+    private final MarketQuoteService marketQuoteService;
+    private final InstrumentMasterRepository instrumentRepo;
 
     @Value("${api.groq.key}")
     private String groqApiKey;
@@ -226,35 +231,159 @@ public class AiAdvisorServiceImpl {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // Compound model call for price queries (web search enabled)
+    // Price query handler: real Upstox data first, compound fallback
     // ════════════════════════════════════════════════════════════════
     private String callCompoundForPriceQuery(String userMessage) {
         String today = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
+
+        // Step 1: Try to find real instrument data from Upstox
+        String realPriceData = fetchRealPriceData(userMessage);
+
+        if (realPriceData != null && !realPriceData.isBlank()) {
+            // We have REAL data — use lite model to format a nice response
+            log.info("Found real market data, using lite model with injected prices");
+            String prompt = "You are DJ-AI, an Indian financial advisor. Today: " + today + ".\n\n"
+                    + "REAL-TIME MARKET DATA (from Upstox/NSE/BSE — these are VERIFIED live prices):\n"
+                    + realPriceData + "\n\n"
+                    + "RULES:\n"
+                    + "1. Use ONLY the prices provided above. Do NOT change or guess different prices.\n"
+                    + "2. Format with Markdown: ## heading, **bold** prices, | tables |.\n"
+                    + "3. Add brief analysis (2-3 sentences) about the stock/ETF.\n"
+                    + "4. Keep response under 200 words.\n"
+                    + "5. All prices in \u20b9 (INR).\n"
+                    + "At the end add: ## Follow-ups with 3 numbered questions.";
+
+            List<Map<String, String>> messages = new ArrayList<>();
+            messages.add(Map.of("role", "system", "content", prompt));
+            messages.add(Map.of("role", "user", "content", userMessage));
+
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("model", groqModelLite);
+            payload.put("messages", messages);
+            payload.put("temperature", 0.3);
+            payload.put("max_tokens", 1500);
+
+            return callGroqApiWithRetry(payload);
+        }
+
+        // Step 2: No instrument found — fall back to compound model (web search)
+        // This handles physical gold, silver, crypto, etc.
+        log.info("No instrument found, falling back to compound model web search");
         String miniPrompt = "You are DJ-AI, an Indian financial advisor. Today: " + today + ".\n\n"
-                + "CRITICAL RULES:\n"
-                + "1. SEARCH the web for the EXACT CURRENT LIVE PRICE from NSE, BSE, Moneycontrol, or Google Finance.\n"
-                + "2. NEVER guess or calculate prices. Always look up the actual traded price.\n"
-                + "3. For ETFs (GoldBees, SilverBees, NiftyBees, LiquidBees):\n"
-                + "   - Search for the EXACT NSE ticker price (e.g., 'GOLDBEES NSE price today').\n"
-                + "   - GoldBees (Nippon India ETF Gold BeES) trades at ~₹100-200 per unit on NSE. 1 unit = 0.01g gold.\n"
-                + "   - NEVER calculate ETF price from gold price. Look up the actual NSE/BSE traded price.\n"
-                + "4. For stocks: search '<stock name> NSE price today' for the exact live price.\n"
-                + "5. For gold/silver: search 'gold price India today per gram' for physical gold rates.\n"
-                + "6. All prices MUST be in ₹ (INR). NEVER use $.\n\n"
-                + "FORMAT: Use Markdown with ## headings, **bold** prices, and | tables |. Keep under 200 words.\n"
-                + "At the end, add: ## Follow-ups with 3 numbered follow-up questions.";
+                + "SEARCH the web for the EXACT CURRENT LIVE PRICE. "
+                + "Use ONLY \u20b9 (INR). NEVER guess prices.\n"
+                + "Format: ## heading, **bold** prices, | tables |. Keep under 200 words.\n"
+                + "At the end add: ## Follow-ups with 3 numbered questions.";
 
         List<Map<String, String>> messages = new ArrayList<>();
         messages.add(Map.of("role", "system", "content", miniPrompt));
         messages.add(Map.of("role", "user", "content", userMessage));
 
         Map<String, Object> payload = new HashMap<>();
-        payload.put("model", groqModel); // compound model — has web search
+        payload.put("model", groqModel);
         payload.put("messages", messages);
-        payload.put("temperature", 0.3); // Lower temp for more factual responses
+        payload.put("temperature", 0.3);
         payload.put("max_tokens", 1500);
 
         return callGroqApiWithRetry(payload);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Extract stock/ETF symbols from message and fetch real Upstox data
+    // ════════════════════════════════════════════════════════════════
+    private String fetchRealPriceData(String userMessage) {
+        try {
+            String lower = userMessage.toLowerCase().trim();
+
+            // Known symbol mappings for common queries
+            String[] searchTerms = extractSearchTerms(lower);
+
+            StringBuilder priceData = new StringBuilder();
+            for (String term : searchTerms) {
+                List<InstrumentMaster> instruments = instrumentRepo.search(term, null, 3);
+                if (!instruments.isEmpty()) {
+                    for (InstrumentMaster inst : instruments) {
+                        try {
+                            var quote = marketQuoteService.getQuote(inst.getInstrumentKey());
+                            if (quote != null && quote.getLtp() > 0) {
+                                priceData.append(String.format(
+                                        "- %s (%s) on %s: LTP = \u20b9%.2f, Prev Close = \u20b9%.2f, Change = %.2f%%\n",
+                                        quote.getName() != null ? quote.getName() : inst.getTradingSymbol(),
+                                        inst.getTradingSymbol(),
+                                        inst.getExchange(),
+                                        quote.getLtp(),
+                                        quote.getPrevClose(),
+                                        quote.getChangePercent()));
+                            }
+                        } catch (Exception e) {
+                            log.warn("Failed to fetch quote for {}: {}", inst.getTradingSymbol(), e.getMessage());
+                        }
+                    }
+                }
+            }
+
+            String result = priceData.toString().trim();
+            return result.isEmpty() ? null : result;
+        } catch (Exception e) {
+            log.warn("Failed to fetch real price data: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Extract potential search terms from user message
+    // ════════════════════════════════════════════════════════════════
+    private String[] extractSearchTerms(String lower) {
+        // Known aliases
+        Map<String, String> aliases = new HashMap<>();
+        aliases.put("goldbees", "GOLDBEES");
+        aliases.put("gold bees", "GOLDBEES");
+        aliases.put("silverbees", "SILVERBEES");
+        aliases.put("silver bees", "SILVERBEES");
+        aliases.put("niftybees", "NIFTYBEES");
+        aliases.put("nifty bees", "NIFTYBEES");
+        aliases.put("liquidbees", "LIQUIDBEES");
+        aliases.put("reliance", "RELIANCE");
+        aliases.put("tcs", "TCS");
+        aliases.put("infosys", "INFY");
+        aliases.put("infy", "INFY");
+        aliases.put("hdfc bank", "HDFCBANK");
+        aliases.put("hdfcbank", "HDFCBANK");
+        aliases.put("icici bank", "ICICIBANK");
+        aliases.put("sbi", "SBIN");
+        aliases.put("tatamotors", "TATAMOTORS");
+        aliases.put("tata motors", "TATAMOTORS");
+        aliases.put("itc", "ITC");
+        aliases.put("wipro", "WIPRO");
+        aliases.put("titan", "TITAN");
+
+        List<String> terms = new ArrayList<>();
+        for (Map.Entry<String, String> entry : aliases.entrySet()) {
+            if (lower.contains(entry.getKey())) {
+                terms.add(entry.getValue());
+            }
+        }
+
+        // If no alias matched, try to extract capitalized words or symbols
+        if (terms.isEmpty()) {
+            // Try each word as a potential symbol
+            String[] words = lower.replaceAll("[^a-z0-9\\s]", "").split("\\s+");
+            for (String word : words) {
+                if (word.length() >= 2 && !isStopWord(word)) {
+                    terms.add(word.toUpperCase());
+                }
+            }
+        }
+
+        return terms.toArray(new String[0]);
+    }
+
+    private boolean isStopWord(String word) {
+        return java.util.Set.of(
+                "the", "is", "of", "in", "for", "and", "or", "to", "at", "on",
+                "what", "how", "much", "price", "current", "today", "now",
+                "give", "me", "show", "tell", "can", "you", "please",
+                "stock", "share", "etf", "rate", "value", "cost").contains(word);
     }
 
     public List<ChatSessionDto> getUserSessions(Long userId) {
