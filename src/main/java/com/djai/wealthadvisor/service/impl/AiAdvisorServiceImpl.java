@@ -176,20 +176,23 @@ public class AiAdvisorServiceImpl {
 
     // ════════════════════════════════════════════════════════════════
     // Helper: find follow-up section in AI response
+    // Handles: ## Follow-ups, ## Follow‑ups (non-breaking hyphen),
+    // **Follow-up Questions**, Follow-Ups, etc.
     // ════════════════════════════════════════════════════════════════
     private int findFollowUpIndex(String text) {
-        String[] markers = { "## Follow-ups", "## Follow-Ups", "## Follow ups",
-                "**Follow-ups**", "**Follow-Ups**", "**Follow ups**",
-                "### Follow-ups", "### Follow-Ups",
-                "Follow-ups\n", "Follow-Ups\n" };
-        int earliest = -1;
-        for (String m : markers) {
-            int idx = text.indexOf(m);
-            if (idx != -1 && (earliest == -1 || idx < earliest)) {
-                earliest = idx;
-            }
+        // Use regex to match all dash variants (-, ‑, –, —) and common headings
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+                "(?m)^#{1,3}\\s*Follow[\\-\u2010\u2011\u2012\u2013\u2014\\s]?[Uu]p[s]?(?:\\s+[Qq]uestions?)?\\s*$" +
+                        "|" +
+                        "(?m)^\\*\\*Follow[\\-\u2010\u2011\u2012\u2013\u2014\\s]?[Uu]p[s]?(?:\\s+[Qq]uestions?)?\\*\\*\\s*$"
+                        +
+                        "|" +
+                        "(?m)^Follow[\\-\u2010\u2011\u2012\u2013\u2014\\s]?[Uu]p[s]?(?:\\s+[Qq]uestions?)?\\s*$");
+        java.util.regex.Matcher matcher = pattern.matcher(text);
+        if (matcher.find()) {
+            return matcher.start();
         }
-        return earliest;
+        return -1;
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -200,12 +203,20 @@ public class AiAdvisorServiceImpl {
             return false;
         String lower = message.toLowerCase();
         String[] priceKeywords = {
-                "gold price", "silver price", "current price", "today price",
-                "nifty", "sensex", "stock price", "share price",
-                "bitcoin price", "crypto price", "market price",
-                "goldbees", "gold etf", "commodity price",
-                "what is the price", "how much is", "rate of gold",
-                "gold rate", "silver rate", "oil price"
+                // Gold & commodities
+                "gold price", "silver price", "gold rate", "silver rate",
+                "oil price", "crude price", "commodity price",
+                // ETFs & mutual funds
+                "goldbees", "gold bees", "gold etf", "silverbees", "silver etf",
+                "niftybees", "liquidbees", "etf price", "bees price",
+                // Stock market
+                "nifty", "sensex", "stock price", "share price", "market price",
+                // Crypto
+                "bitcoin price", "crypto price", "ethereum price",
+                // Generic price queries
+                "current price", "today price", "what is the price",
+                "how much is", "live price", "latest price",
+                "price of", "rate of", "value of"
         };
         for (String keyword : priceKeywords) {
             if (lower.contains(keyword))
@@ -215,15 +226,23 @@ public class AiAdvisorServiceImpl {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // Compound model call for price queries (tiny prompt, web search enabled)
+    // Compound model call for price queries (web search enabled)
     // ════════════════════════════════════════════════════════════════
     private String callCompoundForPriceQuery(String userMessage) {
         String today = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
-        String miniPrompt = "You are DJ-AI, an Indian financial advisor. Today: " + today
-                + ". SEARCH the web for CURRENT prices. Use ONLY ₹ (INR). "
-                + "Use proper Markdown: ## headings, **bold** prices, | tables |. "
-                + "Keep response under 200 words. "
-                + "At the end add: ## Follow-ups with 3 numbered questions.";
+        String miniPrompt = "You are DJ-AI, an Indian financial advisor. Today: " + today + ".\n\n"
+                + "CRITICAL RULES:\n"
+                + "1. SEARCH the web for the EXACT CURRENT LIVE PRICE from NSE, BSE, Moneycontrol, or Google Finance.\n"
+                + "2. NEVER guess or calculate prices. Always look up the actual traded price.\n"
+                + "3. For ETFs (GoldBees, SilverBees, NiftyBees, LiquidBees):\n"
+                + "   - Search for the EXACT NSE ticker price (e.g., 'GOLDBEES NSE price today').\n"
+                + "   - GoldBees (Nippon India ETF Gold BeES) trades at ~₹100-200 per unit on NSE. 1 unit = 0.01g gold.\n"
+                + "   - NEVER calculate ETF price from gold price. Look up the actual NSE/BSE traded price.\n"
+                + "4. For stocks: search '<stock name> NSE price today' for the exact live price.\n"
+                + "5. For gold/silver: search 'gold price India today per gram' for physical gold rates.\n"
+                + "6. All prices MUST be in ₹ (INR). NEVER use $.\n\n"
+                + "FORMAT: Use Markdown with ## headings, **bold** prices, and | tables |. Keep under 200 words.\n"
+                + "At the end, add: ## Follow-ups with 3 numbered follow-up questions.";
 
         List<Map<String, String>> messages = new ArrayList<>();
         messages.add(Map.of("role", "system", "content", miniPrompt));
@@ -232,7 +251,7 @@ public class AiAdvisorServiceImpl {
         Map<String, Object> payload = new HashMap<>();
         payload.put("model", groqModel); // compound model — has web search
         payload.put("messages", messages);
-        payload.put("temperature", 0.7);
+        payload.put("temperature", 0.3); // Lower temp for more factual responses
         payload.put("max_tokens", 1500);
 
         return callGroqApiWithRetry(payload);
