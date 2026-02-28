@@ -121,6 +121,31 @@ public class AiAdvisorServiceImpl {
                 rawReply = "I'm sorry, I couldn't generate a response for that query. Could you please rephrase your question?";
             }
 
+            // Parse follow-up suggestions from the AI response
+            List<String> followUps = new ArrayList<>();
+            String cleanReply = rawReply;
+            int followUpIdx = rawReply.indexOf("## Follow-ups");
+            if (followUpIdx == -1)
+                followUpIdx = rawReply.indexOf("## Follow-Ups");
+            if (followUpIdx == -1)
+                followUpIdx = rawReply.indexOf("**Follow-ups**");
+            if (followUpIdx == -1)
+                followUpIdx = rawReply.indexOf("**Follow-Ups**");
+            if (followUpIdx != -1) {
+                String followUpSection = rawReply.substring(followUpIdx);
+                cleanReply = rawReply.substring(0, followUpIdx).trim();
+                // Extract numbered items like "1. What is..." or "- What is..."
+                for (String line : followUpSection.split("\n")) {
+                    String trimmed = line.trim();
+                    if (trimmed.matches("^\\d+\\.\\s+.+") || trimmed.matches("^[-*]\\s+.+")) {
+                        String question = trimmed.replaceFirst("^(\\d+\\.\\s+|[-*]\\s+)", "").trim();
+                        if (!question.isBlank()) {
+                            followUps.add(question);
+                        }
+                    }
+                }
+            }
+
             saveMessage(session, "assistant", rawReply);
 
             session.setUpdatedAt(LocalDateTime.now());
@@ -128,7 +153,8 @@ public class AiAdvisorServiceImpl {
 
             response.setSessionId(session.getId());
             response.setChatTitle(session.getTitle());
-            response.setReply(rawReply);
+            response.setReply(cleanReply);
+            response.setFollowUps(followUps.isEmpty() ? null : followUps);
             response.setStatus("SUCCESS");
 
         } catch (Exception e) {
