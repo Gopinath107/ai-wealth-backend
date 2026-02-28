@@ -73,47 +73,48 @@ public class AiPromptService {
             }
         }
 
-        // 5. REAL-TIME DATA RULES
-        sb.append("\n=== REAL-TIME DATA RULES (CRITICAL) ===\n");
+        // 5. RESPONSE LENGTH CONTROL (CRITICAL)
+        sb.append("\n=== RESPONSE LENGTH CONTROL (MUST FOLLOW) ===\n");
         sb.append(
-                "1. When asked about ANY price (gold, silver, stocks, crypto, commodity): SEARCH for the CURRENT REAL-TIME price as of today (")
+                "- For GREETINGS (hi, hello, hey, good morning): Reply in 2-3 sentences MAX. Be friendly, ask how you can help. DO NOT dump financial analysis.\n");
+        sb.append("- For SIMPLE questions (what is X, define Y): 3-5 sentences max.\n");
+        sb.append(
+                "- For FINANCIAL ANALYSIS (stock analysis, gold price, market outlook): Use structured markdown with headings, tables, and bullets. Keep under 200 words before the follow-ups section.\n");
+        sb.append("- NEVER write walls of text. Be concise and scannable.\n");
+
+        // 6. PRICE & MARKET DATA RULES
+        sb.append("\n=== PRICE & MARKET DATA RULES ===\n");
+        sb.append(
+                "1. When asked about ANY price (gold, silver, stocks, crypto, commodity): provide the CURRENT approximate India price as of today (")
                 .append(today).append(").\n");
-        sb.append(
-                "2. Use ONLY Indian prices in ₹ (INR). NEVER use $. For gold, give price per gram (24K) and per 10g in India.\n");
-        sb.append("3. NEVER guess or use outdated training data for prices. Always search for the latest.\n");
-        sb.append("4. For stock/commodity predictions: cite real analyst forecasts with sources when possible.\n");
-        sb.append("5. For Monday opening predictions: reference last trading session close and weekend global cues.\n");
+        sb.append("2. Use ONLY Indian prices in ₹ (INR). NEVER use $. For gold: give per gram (24K) AND per 10g.\n");
+        sb.append("3. For stock/commodity predictions: cite analyst forecasts when possible.\n");
+        sb.append("4. For Monday/next session predictions: reference last trading session close and global cues.\n");
 
-        // 6. RESPONSE FORMATTING RULES — USE MARKDOWN
-        sb.append("\n=== RESPONSE FORMATTING RULES ===\n");
-        sb.append("1. ALWAYS use Markdown formatting for structured, readable responses.\n");
-        sb.append("2. Use **bold** for key terms, numbers, and important highlights.\n");
-        sb.append("3. Use ## headings to organize sections of your response.\n");
-        sb.append("4. Use bullet points (- or *) for lists of recommendations or data points.\n");
-        sb.append(
-                "5. Use Markdown tables (| Header | Header |) when comparing stocks or presenting data side-by-side.\n");
-        sb.append("6. Use > blockquotes for important caveats or highlights.\n");
-        sb.append("7. Keep paragraphs short (2-3 sentences max). Use line breaks between sections.\n");
-        sb.append("8. Number your recommendations (1. 2. 3.) for actionable advice.\n");
+        // 7. RESPONSE FORMATTING RULES — STRICT MARKDOWN
+        sb.append("\n=== RESPONSE FORMATTING RULES (STRICT) ===\n");
+        sb.append("1. ALWAYS use proper Markdown. Every response MUST have at least one heading (##).\n");
+        sb.append("2. Use **bold** for ALL numbers, prices, and percentages (e.g. **₹16,871**, **+2.3%**).\n");
+        sb.append("3. Use Markdown tables for price data. Example:\n");
+        sb.append("   | Item | Value |\n   |------|-------|\n   | **Gold 24K (1g)** | **₹16,871** |\n");
+        sb.append("4. Use bullet points for lists. Use numbered lists for actionable steps.\n");
+        sb.append("5. Use > blockquotes for key takeaways.\n");
+        sb.append("6. Keep paragraphs to 2-3 sentences. Add line breaks between sections.\n");
 
-        // 7. FOLLOW-UP SUGGESTIONS
-        sb.append("\n=== FOLLOW-UP SUGGESTIONS (IMPORTANT) ===\n");
-        sb.append("At the END of EVERY response, add a section:\n");
+        // 8. FOLLOW-UP SUGGESTIONS
+        sb.append("\n=== FOLLOW-UP SUGGESTIONS ===\n");
+        sb.append("At the END of EVERY response (except greetings), add:\n");
         sb.append("## Follow-ups\n");
-        sb.append("- List 4-5 related follow-up questions the user might want to ask next.\n");
-        sb.append("- Make them specific and actionable based on the topic discussed.\n");
-        sb.append("- Format as a numbered list.\n");
+        sb.append("List 4-5 specific follow-up questions as a numbered list.\n");
 
-        // 8. INSTRUCTIONS
+        // 9. INSTRUCTIONS
         sb.append("\n=== ADVISORY INSTRUCTIONS ===\n");
         sb.append(
                 "1. If asking 'What should I buy?', look at the watchlist and recommend based on positive momentum.\n");
         sb.append("2. If the user can't afford a stock (Price > Cash Balance), mention it politely.\n");
         sb.append("3. If the user asks about their goals, analyze progress and provide actionable advice.\n");
-        sb.append("4. Provide direct answers without fluff.\n");
-        sb.append("5. If you don't have enough information, ask a specific follow-up question.\n");
-        sb.append(
-                "6. This IS a personalized financial advisory app. Do NOT add any disclaimers like 'this is not financial advice' or 'consult a professional'. Give direct, confident advice.\n");
+        sb.append("4. Provide direct answers without fluff. NO disclaimers.\n");
+        sb.append("5. This IS a personalized financial advisory app. Give direct, confident advice.\n");
 
         return sb.toString();
     }
