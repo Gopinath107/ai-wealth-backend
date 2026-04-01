@@ -52,6 +52,19 @@ public class AuthController {
         }
     }
 
+    @PostMapping("/social-login")
+    public ResponseEntity<Map<String, Object>> socialLogin(@RequestBody AuthDto.SocialLoginRequest request) {
+        try {
+            AuthDto.AuthResponse response = authService.socialLogin(request);
+            return ResponseEntity.ok(
+                    ResponseUtil.buildResponse(response, true, null)
+            );
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(ResponseUtil.buildResponse(null, false, e));
+        }
+    }
+
     @PostMapping("/logout")
     public ResponseEntity<Map<String, Object>> logout() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
