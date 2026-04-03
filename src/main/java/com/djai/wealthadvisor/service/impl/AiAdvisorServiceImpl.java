@@ -130,7 +130,7 @@ public class AiAdvisorServiceImpl {
             try { goals = goalService.list(userId); }
             catch (Exception e) { log.warn("Failed to fetch goals for user {}", userId); goals = new ArrayList<>(); }
 
-            List<AiChatMessage> history = messageRepository.findBySessionId(session.getId(), PageRequest.of(0, 10));
+            List<AiChatMessage> history = messageRepository.findBySessionId(session.getId(), PageRequest.of(0, 4)); // 2 turns max — avoid 413 PAYLOAD_TOO_LARGE
             Collections.reverse(history);
 
             String rawReply;
@@ -569,7 +569,7 @@ public class AiAdvisorServiceImpl {
         payload.put("model",       groqModel);
         payload.put("messages",    messages);
         payload.put("temperature", 0.3);
-        payload.put("max_tokens",  1500);
+        payload.put("max_tokens",  800); // short commodity price reply
 
         return callGroqApiWithRetry(payload);
     }
@@ -633,8 +633,13 @@ public class AiAdvisorServiceImpl {
         messages.add(Map.of("role", "system", "content", systemPrompt));
         for (AiChatMessage msg : history) {
             String content = msg.getContent();
-            if (content != null && !content.equals(currentMsg))
+            if (content != null && !content.equals(currentMsg)) {
+                // Truncate long AI responses to stay within Groq token limit
+                if (content.length() > 500) {
+                    content = content.substring(0, 500) + "…";
+                }
                 messages.add(Map.of("role", msg.getRole(), "content", content));
+            }
         }
         messages.add(Map.of("role", "user",
                 "content", currentMsg != null ? currentMsg : ""));
@@ -643,7 +648,7 @@ public class AiAdvisorServiceImpl {
         payload.put("model",       groqModelLite);
         payload.put("messages",    messages);
         payload.put("temperature", 0.7);
-        payload.put("max_tokens",  1500);
+        payload.put("max_tokens",  1000); // headroom within 6k Groq context limit
         return payload;
     }
 
