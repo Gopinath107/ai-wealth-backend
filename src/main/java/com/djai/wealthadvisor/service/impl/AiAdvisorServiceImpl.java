@@ -122,8 +122,8 @@ public class AiAdvisorServiceImpl {
                 goals = new ArrayList<>();
             }
 
-            // Limiting to 4 messages reduces Groq payload size (~60%) and prevents 413
-            List<AiChatMessage> history = messageRepository.findBySessionId(session.getId(), PageRequest.of(0, 4));
+            // Limiting to 3 messages — system prompt + price data consume most of the 6k Groq limit
+            List<AiChatMessage> history = messageRepository.findBySessionId(session.getId(), PageRequest.of(0, 3));
             Collections.reverse(history);
 
             String rawReply;
@@ -133,13 +133,14 @@ public class AiAdvisorServiceImpl {
             String realPriceData = fetchRealPriceData(text);
 
             if (realPriceData != null && !realPriceData.isBlank()) {
-                // If instruments found, use standard chat with live price injection
+                // Cap realPriceData at 400 chars to prevent system prompt from ballooning
+                String priceSnippet = realPriceData.length() > 400
+                        ? realPriceData.substring(0, 400) + "..."
+                        : realPriceData;
+
                 log.info("Found real market data, injecting into standard chat response");
                 String systemPrompt = aiPromptService.buildSystemPrompt(user, watchlist, goals);
-                systemPrompt += "\n\nREAL-TIME MARKET DATA (from Upstox/NSE/BSE):\n" + realPriceData
-                        + "\nRULES:\n1. Use these verified live prices in your response if relevant.\n"
-                        + "2. Format your response clearly with Markdown.\n"
-                        + "3. Add a brief analysis.";
+                systemPrompt += "\nLIVE PRICE: " + priceSnippet;
 
                 Map<String, Object> payload = prepareGroqPayload(systemPrompt, history, text);
                 rawReply = callGroqApiWithRetry(payload);
