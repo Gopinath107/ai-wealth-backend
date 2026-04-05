@@ -122,7 +122,8 @@ public class AiAdvisorServiceImpl {
                 goals = new ArrayList<>();
             }
 
-            List<AiChatMessage> history = messageRepository.findBySessionId(session.getId(), PageRequest.of(0, 10));
+            // Limiting to 4 messages reduces Groq payload size (~60%) and prevents 413
+            List<AiChatMessage> history = messageRepository.findBySessionId(session.getId(), PageRequest.of(0, 4));
             Collections.reverse(history);
 
             String rawReply;
@@ -280,7 +281,7 @@ public class AiAdvisorServiceImpl {
         payload.put("model", groqModel);
         payload.put("messages", messages);
         payload.put("temperature", 0.3);
-        payload.put("max_tokens", 1500);
+        payload.put("max_tokens", 800); // Reduced from 1500 to avoid 413
 
         return callGroqApiWithRetry(payload);
     }
@@ -456,16 +457,20 @@ public class AiAdvisorServiceImpl {
         for (AiChatMessage msg : history) {
             String content = msg.getContent();
             if (content != null && !content.equals(currentMsg)) {
-                messages.add(Map.of("role", msg.getRole(), "content", content));
+                // Truncate long historical messages to avoid 413  
+                String truncated = content.length() > 500
+                        ? content.substring(0, 500) + "..."
+                        : content;
+                messages.add(Map.of("role", msg.getRole(), "content", truncated));
             }
         }
         messages.add(Map.of("role", "user", "content", currentMsg != null ? currentMsg : ""));
 
         Map<String, Object> payload = new HashMap<>();
-        payload.put("model", groqModelLite); // Use lite model — compound crashes with large system prompts
+        payload.put("model", groqModelLite); // Use lite model — compound crashes with large system prompts 
         payload.put("messages", messages);
         payload.put("temperature", 0.7);
-        payload.put("max_tokens", 1500);
+        payload.put("max_tokens", 1000); // Reduced from 1500 to avoid 413
         return payload;
     }
 
