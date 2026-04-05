@@ -14,6 +14,7 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.ResourceAccessException;
 
 import com.djai.wealthadvisor.dto.AdvisorRequestDto;
 import com.djai.wealthadvisor.dto.AdvisorResponseDto;
@@ -53,6 +54,8 @@ public class AiAdvisorServiceImpl {
     private final ObjectMapper objectMapper;
     private final MarketQuoteService marketQuoteService;
     private final InstrumentMasterRepository instrumentRepo;
+    // Injected Spring bean (AppConfig) — has 15s connect / 90s read timeout
+    private final RestClient restClient;
 
     @Value("${api.groq.key}")
     private String groqApiKey;
@@ -60,13 +63,14 @@ public class AiAdvisorServiceImpl {
     @Value("${api.groq.url}")
     private String groqUrl;
 
+    // compound-beta supports real-time web search via Groq
     @Value("${api.groq.model}")
-    private String groqModel; // groq/compound — only used as fallback for web search
+    private String groqCompoundModel;
 
+    // llama-3.3-70b-versatile — fast model for standard chat
     @Value("${api.groq.model.lite}")
-    private String groqModelLite; // llama-3.3-70b-versatile — primary model for chat
+    private String groqModelLite;
 
-    private final RestClient restClient = RestClient.create();
     private static final int MAX_RETRIES = 3;
 
     // Thread-local storage for instrument keys found during price queries
@@ -127,28 +131,30 @@ public class AiAdvisorServiceImpl {
 
             String rawReply;
 
-            // Step 1: Always try to identify instruments in the message to show charts &
-            // live prices
+            // Step 1: Always try to identify listed NSE/BSE instruments for chart display
             String realPriceData = fetchRealPriceData(text);
 
             if (realPriceData != null && !realPriceData.isBlank()) {
-                // If instruments found, use standard chat with live price injection
-                log.info("Found real market data, injecting into standard chat response");
+                // Instruments found in our DB — inject the live Upstox quote into the prompt
+                log.info("Found real market data for instruments, injecting into chat context");
                 String systemPrompt = aiPromptService.buildSystemPrompt(user, watchlist, goals);
-                systemPrompt += "\n\nREAL-TIME MARKET DATA (from Upstox/NSE/BSE):\n" + realPriceData
-                        + "\nRULES:\n1. Use these verified live prices in your response if relevant.\n"
-                        + "2. Format your response clearly with Markdown.\n"
-                        + "3. Add a brief analysis.";
+                systemPrompt += "\n\nREAL-TIME MARKET DATA (live from Upstox/NSE/BSE):\n" + realPriceData
+                        + "\nINSTRUCTIONS:\n1. Use these verified live prices as the primary source.\n"
+                        + "2. Format your response clearly with Markdown. Bold all prices.\n"
+                        + "3. Add a brief analysis and sentiment.";
 
                 Map<String, Object> payload = prepareGroqPayload(systemPrompt, history, text);
                 rawReply = callGroqApiWithRetry(payload);
-            } else if (isPriceQuery(text)) {
-                // Step 2: If NO instruments found but it's clearly a price query (e.g.,
-                // physical gold, crypto), use compound search
-                log.info("Price query detected without specific NSE/BSE instruments, using compound model search");
-                rawReply = callCompoundForPriceQueryFallback(text);
+
+            } else if (isRealTimeQuery(text)) {
+                // Step 2: Query requires live data (news, events, prices not in our DB).
+                // Use compound-beta which has built-in Groq web search.
+                log.info("Real-time/news query detected — routing to compound-beta with web search");
+                rawReply = callCompoundWithWebSearch(text, user, watchlist, goals);
+
             } else {
-                // Step 3: Standard chat
+                // Step 3: Standard conversational chat — fast Llama model, no search needed
+                log.info("Standard chat query — using {} model", groqModelLite);
                 String systemPrompt = aiPromptService.buildSystemPrompt(user, watchlist, goals);
                 Map<String, Object> payload = prepareGroqPayload(systemPrompt, history, text);
                 rawReply = callGroqApiWithRetry(payload);
@@ -228,59 +234,89 @@ public class AiAdvisorServiceImpl {
         return -1;
     }
 
+
+
     // ════════════════════════════════════════════════════════════════
-    // Helper: detect price/market queries that need web search
+    // Detect queries that require real-time web data
+    // (news, current events, live prices outside our instrument DB)
     // ════════════════════════════════════════════════════════════════
-    private boolean isPriceQuery(String message) {
-        if (message == null)
-            return false;
+    private boolean isRealTimeQuery(String message) {
+        if (message == null) return false;
         String lower = message.toLowerCase();
-        String[] priceKeywords = {
-                // Gold & commodities
+        // Price / commodity queries
+        String[] keywords = {
+                // Prices
                 "gold price", "silver price", "gold rate", "silver rate",
                 "oil price", "crude price", "commodity price",
-                // ETFs & mutual funds
-                "goldbees", "gold bees", "gold etf", "silverbees", "silver etf",
-                "niftybees", "liquidbees", "etf price", "bees price",
-                // Stock market
                 "nifty", "sensex", "stock price", "share price", "market price",
-                // Crypto
-                "bitcoin price", "crypto price", "ethereum price",
-                // Generic price queries
+                "bitcoin price", "crypto price", "ethereum price", "btc",
                 "current price", "today price", "what is the price",
-                "how much is", "live price", "latest price",
-                "price of", "rate of", "value of"
+                "how much is", "live price", "latest price", "price of", "rate of",
+                "goldbees", "gold etf", "silverbees", "niftybees", "etf price",
+                // News & current events
+                "news", "latest news", "today news", "breaking", "update",
+                "what happened", "what's happening", "current", "recent",
+                "market today", "market now", "market open", "market close",
+                "market outlook", "market analysis", "today's market",
+                // Predictions & analysis requiring fresh data
+                "monday opening", "tomorrow", "next week", "forecast",
+                "impact", "affect", "effect of", "because of",
+                "tariff", "rbi", "fed", "interest rate", "inflation",
+                "budget", "election", "geopolitical", "war", "sanctions",
+                "earnings", "result", "quarterly", "q1", "q2", "q3", "q4",
+                "ipo", "fii", "dii", "fpi", "mutual fund nav"
         };
-        for (String keyword : priceKeywords) {
-            if (lower.contains(keyword))
-                return true;
+        for (String kw : keywords) {
+            if (lower.contains(kw)) return true;
         }
         return false;
     }
 
     // ════════════════════════════════════════════════════════════════
-    // Price query handler: Compound fallback for web search
+    // Compound-beta: Groq's web-search model for real-time answers
+    // Handles news, prices, events — anything needing live internet data
     // ════════════════════════════════════════════════════════════════
-    private String callCompoundForPriceQueryFallback(String userMessage) {
+    private String callCompoundWithWebSearch(String userMessage, User user,
+            List<WatchlistDto> watchlist, List<GoalDto> goals) {
         String today = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
 
-        // No instrument found — fall back to compound model (web search)
-        // This handles physical gold, silver, crypto, etc.
-        String miniPrompt = "You are DJ-AI, an Indian financial advisor. Today: " + today + ".\n\n"
-                + "SEARCH the web for the EXACT CURRENT LIVE PRICE. "
-                + "Use ONLY \u20b9 (INR). NEVER guess prices.\n"
-                + "Format: ## heading, **bold** prices, | tables |. Keep under 200 words.\n"
-                + "At the end add: ## Follow-ups with 3 numbered questions.";
+        // Compact user context summary (to keep tokens low for compound-beta)
+        StringBuilder ctx = new StringBuilder();
+        ctx.append("User: ").append(user.getFullName());
+        if (user.getCashBalance() != null) {
+            ctx.append(" | Cash: \u20b9").append(user.getCashBalance());
+        }
+        if (watchlist != null && !watchlist.isEmpty()) {
+            ctx.append(" | Watching: ");
+            watchlist.stream().limit(5).forEach(w ->
+                ctx.append(w.getTradingSymbol()).append("(").append(w.getLtp()).append(") "));
+        }
+
+        String systemPrompt = "You are DJ-AI, a real-time Indian financial advisor. Today: " + today + ".\n"
+                + "User context: " + ctx + "\n\n"
+                + "CRITICAL: Search the web for the LATEST, REAL-TIME information to answer this question.\n"
+                + "- Always use \u20b9 (INR) for Indian prices.\n"
+                + "- Cite actual current data — never guess or use old information.\n"
+                + "- If asking about news/events: summarize the key facts and their market impact.\n"
+                + "- If asking about prices: give exact current values with % change.\n"
+                + "- Format: ## heading, **bold** numbers/prices, | Markdown tables | for data.\n"
+                + "- Keep response under 250 words before Follow-ups.\n"
+                + "- End every response with: ## Follow-ups\n  (3-4 numbered follow-up questions)";
 
         List<Map<String, String>> messages = new ArrayList<>();
-        messages.add(Map.of("role", "system", "content", miniPrompt));
+        messages.add(Map.of("role", "system", "content", systemPrompt));
         messages.add(Map.of("role", "user", "content", userMessage));
 
         Map<String, Object> payload = new HashMap<>();
-        payload.put("model", groqModel);
+        payload.put("model", groqCompoundModel); 
         payload.put("messages", messages);
-        payload.put("temperature", 0.3);
-        payload.put("max_tokens", 1500);
+        payload.put("temperature", 0.2);  
+        payload.put("max_tokens", 2048);
+        
+        // Enable web search functionalities for the compound model
+        Map<String, Object> enabledTools = new HashMap<>();
+        enabledTools.put("enabled_tools", java.util.Arrays.asList("web_search", "visit_website"));
+        payload.put("compound_custom", Map.of("tools", enabledTools));
 
         return callGroqApiWithRetry(payload);
     }
@@ -470,7 +506,7 @@ public class AiAdvisorServiceImpl {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // API CALL — with retry on 429 rate limit
+    // API CALL — with retry on 429 (rate limit) and transient I/O errors
     // ════════════════════════════════════════════════════════════════
     private String callGroqApiWithRetry(Map<String, Object> payload) {
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -480,28 +516,57 @@ public class AiAdvisorServiceImpl {
                         .contentType(MediaType.APPLICATION_JSON)
                         .body(payload).retrieve().body(String.class);
                 JsonNode root = objectMapper.readTree(body);
-                return root.path("choices").get(0).path("message").path("content").asText();
+                JsonNode choices = root.path("choices");
+                if (choices.isArray() && choices.size() > 0) {
+                    return choices.get(0).path("message").path("content").asText();
+                }
+                // Log unexpected response shape
+                log.warn("Unexpected Groq response shape: {}", body.length() > 500 ? body.substring(0, 500) : body);
+                throw new RuntimeException("Invalid response from Groq API");
+
             } catch (org.springframework.web.client.HttpClientErrorException.TooManyRequests e) {
                 long waitMs = parseRetryDelay(e.getResponseBodyAsString());
                 log.warn("Advisor rate limited (attempt {}/{}). Waiting {}ms...", attempt, MAX_RETRIES, waitMs);
                 if (attempt == MAX_RETRIES) {
-                    throw new RuntimeException("Rate limit exceeded after " + MAX_RETRIES + " retries.");
+                    throw new RuntimeException("Groq rate limit exceeded after " + MAX_RETRIES + " retries.");
                 }
-                try {
-                    Thread.sleep(waitMs);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException("Interrupted during rate limit wait");
+                sleepSafe(waitMs);
+
+            } catch (ResourceAccessException e) {
+                // Network/IO error (connection closed, timeout, etc.) — retry with backoff
+                long backoffMs = (long) Math.pow(2, attempt) * 1000L; // 2s, 4s, 8s
+                log.warn("Groq I/O error on attempt {}/{}: {}. Retrying in {}ms...",
+                        attempt, MAX_RETRIES, e.getMessage(), backoffMs);
+                if (attempt == MAX_RETRIES) {
+                    throw new RuntimeException("Groq connection failed after " + MAX_RETRIES
+                            + " retries: " + e.getMessage());
                 }
+                sleepSafe(backoffMs);
+
             } catch (org.springframework.web.client.HttpClientErrorException e) {
-                log.error("AI API error: {} {}", e.getStatusCode(), e.getResponseBodyAsString());
-                throw new RuntimeException("AI API error: " + e.getStatusCode());
+                log.error("Groq API HTTP error: {} — {}", e.getStatusCode(),
+                        e.getResponseBodyAsString().length() > 300
+                                ? e.getResponseBodyAsString().substring(0, 300)
+                                : e.getResponseBodyAsString());
+                throw new RuntimeException("Groq API error: " + e.getStatusCode());
+
             } catch (Exception e) {
-                log.error("External AI API Error", e);
-                throw new RuntimeException("AI Service is unreachable: " + e.getMessage());
+                log.error("Unexpected Groq API error (attempt {}/{}): {}", attempt, MAX_RETRIES, e.getMessage());
+                if (attempt == MAX_RETRIES) {
+                    throw new RuntimeException("AI Service error: " + e.getMessage());
+                }
+                sleepSafe(2000L * attempt);
             }
         }
         throw new RuntimeException("Failed after " + MAX_RETRIES + " retries");
+    }
+
+    private void sleepSafe(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private long parseRetryDelay(String errorBody) {
