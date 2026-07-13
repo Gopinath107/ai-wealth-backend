@@ -85,4 +85,59 @@ public class AuthServiceImpl implements AuthService {
         user.setPasswordHash(request.getNewPassword());
         userRepository.save(user);
     }
+
+    @org.springframework.beans.factory.annotation.Value("${supabase.jwt.secret:your-supabase-jwt-secret-placeholder}")
+    private String supabaseJwtSecret;
+
+    @Override
+    public AuthDto.AuthResponse socialLogin(AuthDto.SocialLoginRequest request) {
+        try {
+            // Parse the Supabase JWT using the Supabase project JWT secret (HS256)
+            byte[] keyBytes = supabaseJwtSecret.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            javax.crypto.SecretKey signingKey = io.jsonwebtoken.security.Keys.hmacShaKeyFor(keyBytes);
+
+            io.jsonwebtoken.Claims claims = io.jsonwebtoken.Jwts.parser()
+                    .verifyWith(signingKey)
+                    .build()
+                    .parseSignedClaims(request.getSupabaseToken())
+                    .getPayload();
+
+            String email = claims.get("email", String.class);
+            if (email == null) {
+                throw new RuntimeException("Email not found in Social Provider Token");
+            }
+
+            // Extract full name from user_metadata (Supabase standard)
+            java.util.Map<String, Object> userMetadata = claims.get("user_metadata", java.util.Map.class);
+            String fullName = email.split("@")[0]; // Fallback
+            if (userMetadata != null && userMetadata.get("full_name") != null) {
+                fullName = userMetadata.get("full_name").toString();
+            } else if (userMetadata != null && userMetadata.get("name") != null) {
+                fullName = userMetadata.get("name").toString();
+            }
+
+            // Check if user exists in Database
+            User user = userRepository.findByEmailIgnoreCase(email).orElse(null);
+            
+            if (user == null) {
+                // Auto-register new user who logged in via Google/GitHub
+                user = new User();
+                user.setEmail(email);
+                user.setFullName(fullName);
+                // Assign a completely random UUID as password hash so manual login fails without reset
+                user.setPasswordHash(java.util.UUID.randomUUID().toString());
+                user.setCashBalance(new java.math.BigDecimal("100000.00"));
+                user.setIsActive(true);
+                user = userRepository.save(user);
+            }
+
+            // Issue the normal Spring Boot system JWT so the rest of the app works flawlessly
+            String token = jwtUtil.generateToken(user.getEmail(), user.getEmail(), user.getId());
+
+            return new AuthDto.AuthResponse(token, user.getFullName(), user.getEmail(), user.getId());
+
+        } catch (Exception e) {
+            throw new RuntimeException("Social login failed: Invalid or expired token. " + e.getMessage());
+        }
+    }
 }
